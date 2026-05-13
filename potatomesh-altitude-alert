@@ -1,0 +1,163 @@
+altitude_alert.py
+import requests
+import meshtastic
+import meshtastic.tcp_interface
+import time
+import airportsdata
+
+INSTANCE = "http://YOUR_POTATOMESH_IP:41447"
+MESH_HOST = "YOUR_MESHTASTIC_NODE_IP"
+THRESHOLD = 800  # meters
+DEST_NODE = 0000000000  # replace with your destination node ID
+
+airports = airportsdata.load("ICAO")
+seen = set()
+
+def get_city(lat, lon):
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={"lat": lat, "lon": lon, "format": "json"},
+            headers={"User-Agent": "potatomesh-altitude-alert/1.0"},
+            timeout=5
+        )
+        data = r.json()
+        address = data.get("address", {})
+        city = (
+            address.get("city") or
+            address.get("town") or
+            address.get("village") or
+            address.get("county") or
+            "Unknown"
+        )
+        state = address.get("state", "")
+        return f"{city}, {state}" if state else city
+    except Exception as e:
+        print(f"Geocode error: {e}")
+        return "Unknown"
+
+def get_airport_name(icao):
+    airport = airports.get(icao)
+    if airport:
+        return f"{airport['iata'] or icao} ({airport['city']})"
+    return icao
+
+def get_flight(lat, lon, alt_m):
+    try:
+        lamin = lat - 0.5
+        lamax = lat + 0.5
+        lomin = lon - 0.5
+        lomax = lon + 0.5
+        r = requests.get(
+            "https://opensky-network.org/api/states/all",
+            params={"lamin": lamin, "lamax": lamax, "lomin": lomin, "lomax": lomax},
+            timeout=10
+        )
+        data = r.json()
+        states = data.get("states", [])
+        if not states:
+            return None, None
+
+        best = None
+        best_diff = 999999
+        for s in states:
+            opensky_alt = s[13] or s[7]
+            if opensky_alt is None:
+                continue
+            diff = abs(opensky_alt - alt_m)
+            if diff < best_diff:
+                best_diff = diff
+                best = s
+
+        if not best or best_diff >= 500:
+            return None, None
+
+        callsign = (best[1] or "").strip()
+        if not callsign:
+            return None, None
+
+        route = None
+        try:
+            rr = requests.get(
+                f"https://opensky-network.org/api/routes?callsign={callsign}",
+                timeout=5
+            )
+            if rr.status_code == 200:
+                rd = rr.json()
+                stops = rd.get("route", [])
+                if len(stops) >= 2:
+                    origin = get_airport_name(stops[0])
+                    dest = get_airport_name(stops[-1])
+                    route = f"from {origin} to {dest}"
+        except Exception as e:
+            print(f"Route lookup error: {e}")
+
+        return callsign, route
+
+    except Exception as e:
+        print(f"Flight lookup error: {e}")
+        return None, None
+
+while True:
+    try:
+        r = requests.get(f"{INSTANCE}/api/nodes?limit=100")
+        nodes = r.json()
+
+        high_nodes = [
+            n for n in nodes
+            if n.get("altitude") and n.get("altitude") > THRESHOLD
+            and n.get("node_id") not in seen
+        ]
+
+        print(f"Nodes: {len(nodes)}, High: {len(high_nodes)}")
+
+        if high_nodes:
+            iface = meshtastic.tcp_interface.TCPInterface(MESH_HOST)
+            print("Connected.")
+
+            for node in high_nodes:
+                node_id = node.get("node_id")
+                name = node.get("long_name", node_id)
+                alt = node.get("altitude")
+                lat = node.get("latitude")
+                lon = node.get("longitude")
+
+                city = get_city(lat, lon) if lat and lon else "Unknown"
+                callsign, route = get_flight(lat, lon, alt) if lat and lon else (None, None)
+
+                if callsign and route:
+                    msg = (
+                        f"✈️ Airline Meshtastic Node Seen!\n"
+                        f"{name} is on flight {callsign}\n"
+                        f"{route}\n"
+                        f"Near {city}\n"
+                        f"Current altitude: {int(alt)}m"
+                    )
+                elif callsign:
+                    msg = (
+                        f"✈️ Airline Meshtastic Node Seen!\n"
+                        f"{name} is on flight {callsign}\n"
+                        f"Near {city}\n"
+                        f"Current altitude: {int(alt)}m"
+                    )
+                else:
+                    msg = (
+                        f"✈️ Airline Meshtastic Node Seen!\n"
+                        f"{name} spotted near {city}\n"
+                        f"Current altitude: {int(alt)}m\n"
+                        f"(No flight data found)"
+                    )
+
+                print(f"Sending:\n{msg}\n")
+                iface.sendText(msg, destinationId=DEST_NODE)
+                seen.add(node_id)
+                time.sleep(5)
+
+            time.sleep(3)
+            iface.close()
+            print("Done.")
+
+    except Exception as e:
+        print(f"Error: {e}")
+
+    time.sleep(60)
