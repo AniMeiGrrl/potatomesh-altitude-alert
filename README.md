@@ -1,5 +1,5 @@
 # potatomesh-altitude-alert
-# ✈️ PotaroMesh Altitude Alert
+# ✈️ PotatoMesh Altitude Alert
 
 A Python script that monitors a [PotatoMesh](https://github.com/l5yth/potato-mesh) instance for suspiciously high-altitude Meshtastic nodes and cross-references them against live flight data — because sometimes someone brings their radio on a plane.
 
